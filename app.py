@@ -17,6 +17,7 @@ DEFAULT_CSV = APP_DIR / "ktc_values.csv"
 TRENDING_HOURS = 24
 TRENDING_LIMIT = 25
 TRENDING_FETCH = 50  # extra, so 25 remain after kickers/defenses are removed
+TOP_SCORERS = 10
 DROPS_PER_LEAGUE = 3
 
 st.set_page_config(page_title="Waiver Helper", page_icon="🏈", layout="wide")
@@ -55,6 +56,11 @@ def get_rosters(league_ids: tuple) -> dict:
 @st.cache_data(ttl=600, show_spinner=False)
 def get_trending(hours: int, limit: int) -> list:
     return sc.fetch_trending_adds(hours, limit)
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading weekly stats…")
+def get_week_stats(season: str, week: int) -> dict:
+    return sc.fetch_week_stats(season, week)
 
 
 @st.cache_data(show_spinner=False)
@@ -136,10 +142,10 @@ def open_spots_text(n: int) -> str:
     return f"{n} open spot{'s' if n > 1 else ''}"
 
 
-def player_meta(pid: str, p: dict, ktc: dict, adds) -> str:
+def player_meta(pid: str, p: dict, ktc: dict, stat: str | None) -> str:
     bits = [f"{p.get('pos') or '?'} · {p.get('team') or 'FA'}"]
-    if adds is not None:
-        bits.append(f"▲{fmt_count(adds)}")
+    if stat:
+        bits.append(stat)
     if sc.primary_offense_pos(p):
         bits.append(f"KTC {fmt_value(ktc.get(pid))}")
     return " · ".join(f"<span>{html_text(b)}</span>" for b in bits)
@@ -176,7 +182,7 @@ def drop_card(lv: sc.LeagueView, players: dict, ktc: dict, include_stashed: bool
 
 
 def render_player_row(pid: str, players: dict, league_views: list, ktc: dict,
-                      include_stashed: bool, adds: int | None = None, ctx: str = "trend") -> bool:
+                      include_stashed: bool, stat: str | None = None, ctx: str = "trend") -> bool:
     """One compact row. Returns False (and draws nothing) if he's unavailable everywhere."""
     p = players.get(pid)
     avail = sorted(sc.available_leagues(pid, p, league_views), key=lambda x: x.name.lower())
@@ -189,7 +195,7 @@ def render_player_row(pid: str, players: dict, league_views: list, ktc: dict,
         f'<div class="prow">'
         f'<input type="checkbox" id="{tid}" class="dtoggle">'
         f'<div><div class="pname">{html_text(p["name"])}</div>'
-        f'<div class="pmeta">{player_meta(pid, p, ktc, adds)}</div></div>'
+        f'<div class="pmeta">{player_meta(pid, p, ktc, stat)}</div></div>'
         f'{league_chips(avail, my_total)}'
         f'<label for="{tid}" class="dbtn">Drops</label>'
         f'<div class="dpanel">{cards}</div>'
@@ -325,16 +331,63 @@ if query:
         if not render_player_row(pick, players, league_views, ktc, include_stashed, ctx="search"):
             st.info(f"**{players[pick]['name']}** isn't available in any of your selected leagues.")
 
+tab_trend, tab_pts = st.tabs(["🔥 Trending adds", "📈 Top scorers available"])
+
 # ----------------------------------------------------------------------- trending
-st.markdown(f"**Trending adds · last {TRENDING_HOURS}h** · chips link to the league; 🟢 = open roster spot")
-shown = 0
-for item in trending:
-    pid = str(item.get("player_id"))
-    if render_player_row(pid, players, league_views, ktc, include_stashed, adds=item.get("count")):
-        shown += 1
-hidden = len(trending) - shown
-if shown == 0:
-    st.info("None of today's top trending players are available in your leagues.")
-elif hidden:
-    st.caption(f"{hidden} of the top {len(trending)} trending players are rostered in all your leagues "
-               "(or play a position your leagues don't use) and are hidden.")
+with tab_trend:
+    st.markdown(f"**Trending adds · last {TRENDING_HOURS}h** · chips link to the league; "
+                "🟢 = open roster spot")
+    shown = 0
+    for item in trending:
+        pid = str(item.get("player_id"))
+        if render_player_row(pid, players, league_views, ktc, include_stashed,
+                             stat=f"▲{fmt_count(item.get('count'))}"):
+            shown += 1
+    hidden = len(trending) - shown
+    if shown == 0:
+        st.info("None of today's top trending players are available in your leagues.")
+    elif hidden:
+        st.caption(f"{hidden} of the top {len(trending)} trending players are rostered in all your "
+                   "leagues (or play a position your leagues don't use) and are hidden.")
+
+# ----------------------------------------------------------------------- top scorers
+with tab_pts:
+    stats_season = str(state.get("season") or season)
+    cur_week = int(state.get("week") or 0)
+    if state.get("season_type") not in (None, "regular") or cur_week < 1:
+        st.info("Weekly scoring shows once the NFL regular season is under way.")
+    else:
+        try:
+            cur_complete = sc.week_is_complete(get_week_stats(stats_season, cur_week), players)
+        except sc.SleeperError as exc:
+            st.error(str(exc))
+            st.stop()
+        # "Previous week" = newest week whose games are (nearly) all played.
+        default_week = cur_week if cur_complete else max(1, cur_week - 1)
+        weeks = list(range(cur_week, 0, -1))
+        chosen_leagues = [league_lookup[lid] for lid in chosen]
+        scoring_opts = list(sc.SCORING_KEYS)
+        c_week, c_score, _ = st.columns([1.2, 2.4, 3])
+        week = c_week.selectbox(
+            "Week", weeks, index=weeks.index(default_week),
+            format_func=lambda w: f"Week {w}" + (" (in progress)" if w == cur_week and not cur_complete else ""))
+        scoring = c_score.radio("Scoring", scoring_opts, horizontal=True,
+                                index=scoring_opts.index(sc.default_scoring(chosen_leagues)),
+                                help="Defaults to what most of your selected leagues use.")
+        try:
+            week_stats = get_week_stats(stats_season, week)
+        except sc.SleeperError as exc:
+            st.error(str(exc))
+            st.stop()
+        if not week_stats:
+            st.info(f"Sleeper has no stats for week {week} yet.")
+        else:
+            top = sc.top_available_scorers(week_stats, players, sc.SCORING_KEYS[scoring],
+                                           league_views, TOP_SCORERS)
+            st.markdown(f"**Top {TOP_SCORERS} available · week {week} {scoring} points** · "
+                        "available in at least one of your leagues")
+            if not top:
+                st.info("No one who scored that week is available in your selected leagues.")
+            for pid, pts in top:
+                render_player_row(pid, players, league_views, ktc, include_stashed,
+                                  stat=f"{pts:.1f} pts", ctx="pts")

@@ -68,7 +68,7 @@ class SleeperError(RuntimeError):
 
 def get_json(path: str, params: dict | None = None, timeout: int = 30):
     """GET a Sleeper endpoint and return parsed JSON (None if not found / null)."""
-    url = f"{BASE_URL}/{path.lstrip('/')}"
+    url = path if path.startswith("http") else f"{BASE_URL}/{path.lstrip('/')}"
     try:
         resp = requests.get(url, params=params, timeout=timeout)
     except requests.RequestException as exc:
@@ -124,6 +124,29 @@ def fetch_trending_adds(lookback_hours: int = 24, limit: int = 25) -> list[dict]
 
 def fetch_players_raw() -> dict:
     return get_json("players/nfl", timeout=120) or {}
+
+
+def normalize_stats(data) -> dict[str, dict]:
+    """Weekly stats -> {player_id: {stat: value}}.
+
+    The long-standing v1 endpoint returns a dict keyed by player_id; Sleeper's
+    newer stats host returns a list of {"player_id", "stats", ...}. Accept both.
+    """
+    if isinstance(data, dict):
+        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    if isinstance(data, list):
+        return {str(e["player_id"]): (e.get("stats") or {}) for e in data
+                if isinstance(e, dict) and e.get("player_id") is not None}
+    return {}
+
+
+def fetch_week_stats(season: str, week: int, season_type: str = "regular") -> dict[str, dict]:
+    """Player stats for one week. Undocumented endpoint, so try both known forms."""
+    stats = normalize_stats(get_json(f"stats/nfl/{season_type}/{season}/{week}"))
+    if not stats:
+        stats = normalize_stats(get_json(f"https://api.sleeper.com/stats/nfl/{season}/{week}",
+                                         {"season_type": season_type}))
+    return stats
 
 
 # ------------------------------------------------------------------ name handling
@@ -410,3 +433,66 @@ def drop_candidates(lv: LeagueView, players: dict[str, dict], ktc_values: dict[s
 
     out.sort(key=key)
     return out[:n]
+
+
+# ------------------------------------------------------------------ weekly points
+
+SCORING_KEYS = {"PPR": "pts_ppr", "Half PPR": "pts_half_ppr", "Standard": "pts_std"}
+
+
+def default_scoring(leagues: list[dict]) -> str:
+    """Most common reception value across leagues: 1 -> PPR, 0.5 -> Half PPR, 0 -> Standard."""
+    counts = {"PPR": 0, "Half PPR": 0, "Standard": 0}
+    for lg in leagues:
+        rec = (lg.get("scoring_settings") or {}).get("rec")
+        if rec is None:
+            continue
+        label = "PPR" if rec >= 0.75 else "Half PPR" if rec >= 0.25 else "Standard"
+        counts[label] += 1
+    return max(counts, key=lambda k: (counts[k], k == "PPR"))
+
+
+def teams_with_points(stats: dict[str, dict], players: dict[str, dict]) -> int:
+    """How many NFL teams have at least one player with fantasy points that week."""
+    teams = set()
+    for pid, st in stats.items():
+        p = players.get(pid)
+        if p and p.get("team") and (st.get("pts_ppr") or 0) != 0:
+            teams.add(p["team"])
+    return len(teams)
+
+
+def week_is_complete(stats: dict[str, dict], players: dict[str, dict], min_teams: int = 24) -> bool:
+    # A full slate has 26-32 teams (byes); 24+ means only Monday night or less is left.
+    return teams_with_points(stats, players) >= min_teams
+
+
+def player_points(stat_line: dict | None, key: str) -> float | None:
+    if not stat_line:
+        return None
+    v = stat_line.get(key)
+    if v is None and key != "pts_ppr":
+        v = stat_line.get("pts_ppr")  # some lines only carry PPR
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def top_available_scorers(stats: dict[str, dict], players: dict[str, dict], key: str,
+                          league_views: list, n: int = 10) -> list[tuple[str, float]]:
+    """The n highest scorers that week who are available in at least one of my leagues."""
+    ranked = []
+    for pid, line in stats.items():
+        pts = player_points(line, key)
+        if pts is None or pts <= 0:
+            continue
+        p = players.get(pid)
+        if is_excluded(p):
+            continue
+        ranked.append((pts, pid))
+    ranked.sort(key=lambda t: (-t[0], players[t[1]]["rank"]))
+    out = []
+    for pts, pid in ranked:
+        if available_leagues(pid, players[pid], league_views):
+            out.append((pid, pts))
+            if len(out) == n:
+                break
+    return out
