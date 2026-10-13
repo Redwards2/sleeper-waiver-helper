@@ -4,6 +4,8 @@ plus your cheapest drop candidates in each. Read-only: claims are made in Sleepe
 
 from __future__ import annotations
 
+import html
+import re
 from pathlib import Path
 
 import streamlit as st
@@ -42,8 +44,8 @@ def get_leagues(user_id: str, season: str) -> list:
     return sc.fetch_leagues(user_id, season)
 
 
-# One cached call for all leagues: the trending view and the search box both
-# read from this, so each league's rosters are fetched once per TTL window.
+# One cached call for all your leagues: the trending view, the search box and
+# every filter setting read from this, so each league is fetched once per TTL.
 @st.cache_data(ttl=300, show_spinner="Loading rosters…")
 def get_rosters(league_ids: tuple) -> dict:
     return sc.fetch_rosters_bulk(list(league_ids))
@@ -62,56 +64,105 @@ def get_ktc(csv_bytes: bytes, players_version: int) -> sc.KtcMatch:
 
 # ----------------------------------------------------------------------- helpers
 
+# Compact one-row-per-player layout. Chips scroll inside their own box when a
+# player is open in lots of leagues, so every row stays about two lines tall.
+CSS = """
+<style>
+[data-testid="stMainBlockContainer"], .block-container { padding-top: 3.2rem; }
+[data-testid="stMainBlockContainer"] [data-testid="stVerticalBlock"] { gap: 0.45rem; }
+[class*="st-key-prow_"] { border-bottom: 1px solid rgba(128,128,128,.22); padding-bottom: .45rem; }
+.pname { font-weight: 600; line-height: 1.25; }
+.pmeta { font-size: .78rem; opacity: .7; line-height: 1.35; }
+.pmeta span { white-space: nowrap; }
+/* Up to 3 lines of chips; more scroll inside the box (full list is also under Drops). */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; max-height: 68px; overflow-y: auto;
+         scrollbar-width: thin; align-content: flex-start; }
+.chip { box-sizing: border-box; height: 20px; line-height: 18px; font-size: .76rem; padding: 0 8px;
+        border-radius: 10px; white-space: nowrap; border: 1px solid rgba(128,128,128,.35);
+        text-decoration: none !important; color: inherit !important; }
+.chip:hover { border-color: rgba(128,128,128,.85); }
+.chip.open { border-color: #2e9e5b; }
+.chip.count { font-weight: 600; border-style: dashed; }
+</style>
+"""
+CHIP_MAX_CHARS = 26
+
+
 def fmt_value(v) -> str:
     return "unranked" if v is None else f"{v:,.0f}"
 
 
-def render_player_card(pid: str, p: dict, ktc: dict, adds: int | None = None):
-    if not p:
-        st.markdown(f"**Unknown player** `{pid}`")
-        return
-    team = p.get("team") or "FA"
-    st.markdown(f"**{p['name']}**  \n{p.get('pos') or '?'} · {team}")
-    bits = []
+def fmt_count(n) -> str:
+    if n is None:
+        return ""
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.1f}K" if n >= 1e3 else str(n)
+
+
+def html_text(s: str) -> str:
+    # $ is swapped for an entity so "$5 ... $10" league names never render as math
+    return html.escape(str(s)).replace("$", "&#36;")
+
+
+def md_text(s: str) -> str:
+    return re.sub(r"([\\`*_\[\]#$|<>~])", r"\\\1", str(s))
+
+
+def player_meta(pid: str, p: dict, ktc: dict, adds) -> str:
+    bits = [f"{p.get('pos') or '?'} · {p.get('team') or 'FA'}"]
     if adds is not None:
-        bits.append(f"▲ {adds:,} adds / {TRENDING_HOURS}h")
+        bits.append(f"▲{fmt_count(adds)}")
     if sc.primary_offense_pos(p):
         bits.append(f"KTC {fmt_value(ktc.get(pid))}")
-    if bits:
-        st.caption(" · ".join(bits))
+    return " · ".join(f"<span>{html_text(b)}</span>" for b in bits)
 
 
-def render_league_block(lv: sc.LeagueView, players: dict, ktc: dict, include_stashed: bool):
-    label = lv.name
+def league_chips(avail: list, total: int) -> str:
+    chips = [f'<span class="chip count" title="Available in {len(avail)} of {total} leagues">'
+             f'{len(avail)}/{total}</span>']
+    for lv in avail:
+        short = lv.name if len(lv.name) <= CHIP_MAX_CHARS else lv.name[:CHIP_MAX_CHARS - 1] + "…"
+        room = f" — {lv.open_spots} open spot{'s' if lv.open_spots > 1 else ''}" if lv.open_spots else ""
+        cls = "chip open" if lv.open_spots else "chip"
+        chips.append(f'<a class="{cls}" href="{lv.url}" target="_blank" '
+                     f'title="{html_text(lv.name + room)}">{html_text(short)}</a>')
+    return f'<div class="chips">{"".join(chips)}</div>'
+
+
+def drops_markdown(lv: sc.LeagueView, players: dict, ktc: dict, include_stashed: bool) -> str:
+    head = f"**{md_text(lv.name)}** [↗]({lv.url})"
     if lv.open_spots:
-        label += f"  ·  🟢 {lv.open_spots} open spot{'s' if lv.open_spots > 1 else ''}"
-    with st.expander(label, expanded=False):
-        if lv.open_spots:
-            st.caption("You have room — no drop needed.")
-        drops = sc.drop_candidates(lv, players, ktc, DROPS_PER_LEAGUE, include_stashed)
-        if not drops:
-            st.caption("No QB/RB/WR/TE drop candidates on this roster.")
-        for i, d in enumerate(drops, 1):
-            tag = f" · _{d.tag}_" if d.tag else ""
-            st.markdown(f"{i}. **{d.name}** ({d.pos}, {d.team or 'FA'}) — KTC {fmt_value(d.value)}{tag}")
-        st.markdown(f"[Open league in Sleeper ↗]({lv.url})")
+        head += f" · 🟢 {lv.open_spots} open spot{'s' if lv.open_spots > 1 else ''}"
+    drops = sc.drop_candidates(lv, players, ktc, DROPS_PER_LEAGUE, include_stashed)
+    if not drops:
+        return head + "  \n_No QB/RB/WR/TE drop candidates_"
+    parts = []
+    for d in drops:
+        tag = f" _{d.tag}_" if d.tag else ""
+        parts.append(f"{md_text(d.name)} ({d.pos}) {fmt_value(d.value)}{tag}")
+    return head + "  \n" + " · ".join(parts)
 
 
 def render_player_row(pid: str, players: dict, league_views: list, ktc: dict,
-                      include_stashed: bool, adds: int | None = None) -> bool:
-    """Draw one row. Returns False (and draws nothing) if he's unavailable everywhere."""
+                      include_stashed: bool, adds: int | None = None, ctx: str = "trend") -> bool:
+    """One compact row. Returns False (and draws nothing) if he's unavailable everywhere."""
     p = players.get(pid)
-    avail = sc.available_leagues(pid, p, league_views)
+    avail = sorted(sc.available_leagues(pid, p, league_views), key=lambda x: x.name.lower())
     if not avail:
         return False
-    left, right = st.columns([1, 3], gap="medium")
-    with left:
-        render_player_card(pid, p, ktc, adds)
-        st.caption(f"Available in {len(avail)} of {len(league_views)} leagues")
-    with right:
-        for lv in sorted(avail, key=lambda x: x.name.lower()):
-            render_league_block(lv, players, ktc, include_stashed)
-    st.divider()
+    with st.container(key=f"prow_{ctx}_{pid}"):
+        name_col, chips_col, drop_col = st.columns([1.7, 6, 0.9], gap="small", vertical_alignment="center")
+        with name_col:
+            st.markdown(f'<div class="pname">{html_text(p["name"])}</div>'
+                        f'<div class="pmeta">{player_meta(pid, p, ktc, adds)}</div>',
+                        unsafe_allow_html=True)
+        with chips_col:
+            my_total = sum(1 for lv in league_views if lv.my_roster is not None)
+            st.markdown(league_chips(avail, my_total), unsafe_allow_html=True)
+        with drop_col:
+            with st.popover("Drops", use_container_width=True):
+                st.caption(f"Cheapest {DROPS_PER_LEAGUE} per league (KTC), {p['name']}")
+                for lv in avail:
+                    st.markdown(drops_markdown(lv, players, ktc, include_stashed))
     return True
 
 
@@ -142,9 +193,8 @@ with st.sidebar:
         get_trending.clear()
         st.rerun()
 
-st.title("🏈 Waiver Helper")
-st.caption("Where each player is available across your Sleeper leagues, with your cheapest drops. "
-           "Read-only — make the claims in Sleeper.")
+st.markdown(CSS, unsafe_allow_html=True)
+st.markdown("#### 🏈 Waiver Helper")
 
 if not username:
     st.info("Enter your Sleeper username in the sidebar to get started.")
@@ -182,7 +232,11 @@ except ValueError as exc:
 ktc = ktc_match.values
 
 with st.sidebar:
-    league_names = {str(lg["league_id"]): lg.get("name") or str(lg["league_id"]) for lg in leagues}
+    st.subheader("League types")
+    picked_types = {t for t in sc.LEAGUE_TYPES
+                    if st.checkbox(t, value=t in sc.DEFAULT_LEAGUE_TYPES, key=f"type_{t}")}
+    typed_leagues = [lg for lg in leagues if sc.league_type(lg) in picked_types]
+    league_names = {str(lg["league_id"]): lg.get("name") or str(lg["league_id"]) for lg in typed_leagues}
     chosen = st.multiselect("Leagues", options=list(league_names), default=list(league_names),
                             format_func=lambda lid: league_names[lid])
     st.caption(f"Season {season} · {user.get('display_name', username)}")
@@ -196,11 +250,13 @@ with st.sidebar:
             st.write(", ".join(ktc_match.ambiguous))
 
 if not chosen:
-    st.info("Pick at least one league in the sidebar.")
+    st.info("No leagues selected. Check a league type (or pick leagues) in the sidebar.")
     st.stop()
 
 try:
-    rosters_by_league = get_rosters(tuple(sorted(chosen)))
+    # Fetch every league once (not just the selected ones) so flipping the
+    # type filter or league picker never triggers another round of requests.
+    rosters_by_league = get_rosters(tuple(sorted(str(lg["league_id"]) for lg in leagues)))
     trending = get_trending(TRENDING_HOURS, TRENDING_LIMIT)
 except sc.SleeperError as exc:
     st.error(str(exc))
@@ -214,7 +270,8 @@ if no_team:
     st.caption(f"Skipping leagues where you don't have a roster: {', '.join(no_team)}")
 
 # ----------------------------------------------------------------------- search
-query = st.text_input("🔎 Search any player", placeholder="e.g. Tyler Allgeier")
+query = st.text_input("Search any player", placeholder="🔎 Search any player, e.g. Tyler Allgeier",
+                      label_visibility="collapsed")
 if query:
     hits = sc.search_players(query, players)
     if not hits:
@@ -228,12 +285,11 @@ if query:
                 "Which player?", hits,
                 format_func=lambda pid: f"{players[pid]['name']} — {players[pid]['pos']}, "
                                         f"{players[pid]['team'] or 'FA'}")
-        if not render_player_row(pick, players, league_views, ktc, include_stashed):
+        if not render_player_row(pick, players, league_views, ktc, include_stashed, ctx="search"):
             st.info(f"**{players[pick]['name']}** isn't available in any of your selected leagues.")
-            st.divider()
 
 # ----------------------------------------------------------------------- trending
-st.subheader(f"Trending adds · last {TRENDING_HOURS}h")
+st.markdown(f"**Trending adds · last {TRENDING_HOURS}h** · chips link to the league; 🟢 = open roster spot")
 shown = 0
 for item in trending:
     pid = str(item.get("player_id"))

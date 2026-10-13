@@ -268,6 +268,22 @@ def match_ktc(ktc: pd.DataFrame, players: dict[str, dict]) -> KtcMatch:
 
 # ------------------------------------------------------------------ league logic
 
+# Sidebar filter options, in display order, with which are checked by default.
+LEAGUE_TYPES = ["Redraft Lineup", "Redraft Bestball", "Dynasty Lineup", "Dynasty Bestball"]
+DEFAULT_LEAGUE_TYPES = {"Dynasty Lineup", "Dynasty Bestball"}
+
+
+def league_type(league: dict) -> str:
+    """Sleeper settings.type: 0 = redraft, 1 = keeper, 2 = dynasty; settings.best_ball = 1.
+
+    Keeper leagues are grouped with Redraft since the filter only has the two kinds.
+    """
+    settings = league.get("settings") or {}
+    kind = "Dynasty" if settings.get("type") == 2 else "Redraft"
+    fmt = "Bestball" if settings.get("best_ball") == 1 else "Lineup"
+    return f"{kind} {fmt}"
+
+
 @dataclass
 class LeagueView:
     league_id: str
