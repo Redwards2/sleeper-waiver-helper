@@ -56,6 +56,8 @@ SLOT_ELIGIBILITY = {
 POSITION_BUCKET = {"DE": "DL", "DT": "DL", "NT": "DL", "CB": "DB", "S": "DB", "SS": "DB",
                    "FS": "DB", "OLB": "LB", "ILB": "LB", "MLB": "LB"}
 NON_ACTIVE_SLOTS = {"IR", "TAXI"}
+# Never shown anywhere (trending, search, drops): not used in Ryan's dynasty leagues.
+EXCLUDED_POSITIONS = {"K", "DEF"}
 
 
 class SleeperError(RuntimeError):
@@ -196,6 +198,21 @@ def primary_offense_pos(player: dict) -> str | None:
     return None
 
 
+def is_excluded(player: dict | None) -> bool:
+    """True for kickers and team defenses (and unknown player IDs)."""
+    if not player:
+        return True
+    if player.get("pos") in EXCLUDED_POSITIONS:
+        return True
+    fpos = set(player.get("fpos") or [])
+    return bool(fpos) and fpos <= EXCLUDED_POSITIONS
+
+
+def top_trending(trending: list[dict], players: dict[str, dict], n: int) -> list[dict]:
+    """First n trending entries that aren't kickers/defenses (request extra so n survive)."""
+    return [t for t in trending if not is_excluded(players.get(str(t.get("player_id"))))][:n]
+
+
 def search_players(query: str, players: dict[str, dict], limit: int = 25) -> list[str]:
     """Player IDs whose normalized name contains every query token; best-known first."""
     q_tokens = normalize_name(query).split()
@@ -203,6 +220,8 @@ def search_players(query: str, players: dict[str, dict], limit: int = 25) -> lis
         return []
     hits = []
     for pid, p in players.items():
+        if is_excluded(p):
+            continue
         name_tokens = p["norm"].split()
         if all(any(nt.startswith(qt) for nt in name_tokens) for qt in q_tokens):
             exact = p["norm"] == " ".join(q_tokens)
@@ -271,6 +290,10 @@ def match_ktc(ktc: pd.DataFrame, players: dict[str, dict]) -> KtcMatch:
 # Sidebar filter options, in display order, with which are checked by default.
 LEAGUE_TYPES = ["Redraft Lineup", "Redraft Bestball", "Dynasty Lineup", "Dynasty Bestball"]
 DEFAULT_LEAGUE_TYPES = {"Dynasty Lineup", "Dynasty Bestball"}
+# Before the draft finishes every player is "unrostered", so these leagues would
+# show up as available for everyone. Sleeper league status values:
+# pre_draft, drafting, in_season, complete.
+PRE_WAIVER_STATUSES = {"pre_draft", "drafting"}
 
 
 def league_type(league: dict) -> str:

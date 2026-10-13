@@ -16,6 +16,7 @@ APP_DIR = Path(__file__).parent
 DEFAULT_CSV = APP_DIR / "ktc_values.csv"
 TRENDING_HOURS = 24
 TRENDING_LIMIT = 25
+TRENDING_FETCH = 50  # extra, so 25 remain after kickers/defenses are removed
 DROPS_PER_LEAGUE = 3
 
 st.set_page_config(page_title="Waiver Helper", page_icon="🏈", layout="wide")
@@ -64,17 +65,20 @@ def get_ktc(csv_bytes: bytes, players_version: int) -> sc.KtcMatch:
 
 # ----------------------------------------------------------------------- helpers
 
-# Compact one-row-per-player layout. Chips scroll inside their own box when a
-# player is open in lots of leagues, so every row stays about two lines tall.
+# Compact one-row-per-player layout, drawn as one HTML block per player.
+# The Drops button is a <label> for a hidden checkbox; checking it reveals the
+# panel under the row with pure CSS, so it opens instantly with no app rerun.
 CSS = """
 <style>
 [data-testid="stMainBlockContainer"], .block-container { padding-top: 3.2rem; }
 [data-testid="stMainBlockContainer"] [data-testid="stVerticalBlock"] { gap: 0.45rem; }
-[class*="st-key-prow_"] { border-bottom: 1px solid rgba(128,128,128,.22); padding-bottom: .45rem; }
+.prow { display: grid; grid-template-columns: 190px minmax(0, 1fr) auto; column-gap: 12px;
+        align-items: center; border-bottom: 1px solid rgba(128,128,128,.22); padding-bottom: .45rem;
+        margin-bottom: 1rem; /* cancels Streamlit's -1rem margin under markdown blocks */ }
 .pname { font-weight: 600; line-height: 1.25; }
 .pmeta { font-size: .78rem; opacity: .7; line-height: 1.35; }
 .pmeta span { white-space: nowrap; }
-/* Up to 3 lines of chips; more scroll inside the box (full list is also under Drops). */
+/* Up to 3 lines of chips; more scroll inside the box (all of them are in the Drops panel). */
 .chips { display: flex; flex-wrap: wrap; gap: 4px; max-height: 68px; overflow-y: auto;
          scrollbar-width: thin; align-content: flex-start; }
 .chip { box-sizing: border-box; height: 20px; line-height: 18px; font-size: .76rem; padding: 0 8px;
@@ -83,6 +87,31 @@ CSS = """
 .chip:hover { border-color: rgba(128,128,128,.85); }
 .chip.open { border-color: #2e9e5b; }
 .chip.count { font-weight: 600; border-style: dashed; }
+.dtoggle { display: none; }
+.dbtn { cursor: pointer; user-select: none; font-size: .85rem; padding: 5px 14px; border-radius: 8px;
+        border: 1px solid rgba(128,128,128,.4); white-space: nowrap; margin: 0; }
+.dbtn:hover { border-color: rgba(128,128,128,.9); }
+.dbtn::after { content: " ▾"; }
+.dtoggle:checked ~ .dbtn { border-color: #ff4b4b; }
+.dtoggle:checked ~ .dbtn::after { content: " ▴"; }
+.dpanel { display: none; grid-column: 1 / -1; margin-top: 8px; gap: 8px;
+          grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+.dtoggle:checked ~ .dpanel { display: grid; }
+.dcard { border: 1px solid rgba(128,128,128,.25); border-radius: 8px; padding: 6px 10px; font-size: .8rem; }
+.dcard.open { border-color: #2e9e5b; }
+.dhead { font-weight: 600; margin-bottom: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dhead a { color: inherit !important; text-decoration: none !important; }
+.dhead a:hover { text-decoration: underline !important; }
+.droom { color: #2e9e5b; font-size: .75rem; margin-bottom: 2px; }
+.dcard ol { margin: 0; padding-left: 1.2rem; }
+.dcard li { margin: 0; line-height: 1.45; }
+.dpos, .dval { opacity: .65; font-size: .74rem; }
+.dtag { font-style: italic; opacity: .65; font-size: .74rem; }
+.dnone { opacity: .6; font-style: italic; }
+@media (max-width: 640px) {
+  .prow { grid-template-columns: minmax(0, 1fr) auto; row-gap: 4px; }
+  .prow .chips { grid-column: 1 / -1; grid-row: 2; }
+}
 </style>
 """
 CHIP_MAX_CHARS = 26
@@ -103,8 +132,8 @@ def html_text(s: str) -> str:
     return html.escape(str(s)).replace("$", "&#36;")
 
 
-def md_text(s: str) -> str:
-    return re.sub(r"([\\`*_\[\]#$|<>~])", r"\\\1", str(s))
+def open_spots_text(n: int) -> str:
+    return f"{n} open spot{'s' if n > 1 else ''}"
 
 
 def player_meta(pid: str, p: dict, ktc: dict, adds) -> str:
@@ -121,25 +150,29 @@ def league_chips(avail: list, total: int) -> str:
              f'{len(avail)}/{total}</span>']
     for lv in avail:
         short = lv.name if len(lv.name) <= CHIP_MAX_CHARS else lv.name[:CHIP_MAX_CHARS - 1] + "…"
-        room = f" — {lv.open_spots} open spot{'s' if lv.open_spots > 1 else ''}" if lv.open_spots else ""
+        room = f" — {open_spots_text(lv.open_spots)}" if lv.open_spots else ""
         cls = "chip open" if lv.open_spots else "chip"
         chips.append(f'<a class="{cls}" href="{lv.url}" target="_blank" '
                      f'title="{html_text(lv.name + room)}">{html_text(short)}</a>')
     return f'<div class="chips">{"".join(chips)}</div>'
 
 
-def drops_markdown(lv: sc.LeagueView, players: dict, ktc: dict, include_stashed: bool) -> str:
-    head = f"**{md_text(lv.name)}** [↗]({lv.url})"
-    if lv.open_spots:
-        head += f" · 🟢 {lv.open_spots} open spot{'s' if lv.open_spots > 1 else ''}"
+def drop_card(lv: sc.LeagueView, players: dict, ktc: dict, include_stashed: bool) -> str:
+    head = (f'<div class="dhead" title="{html_text(lv.name)}">'
+            f'<a href="{lv.url}" target="_blank">{html_text(lv.name)} ↗</a></div>')
+    room = f'<div class="droom">● {open_spots_text(lv.open_spots)}: no drop needed</div>' if lv.open_spots else ""
     drops = sc.drop_candidates(lv, players, ktc, DROPS_PER_LEAGUE, include_stashed)
-    if not drops:
-        return head + "  \n_No QB/RB/WR/TE drop candidates_"
-    parts = []
-    for d in drops:
-        tag = f" _{d.tag}_" if d.tag else ""
-        parts.append(f"{md_text(d.name)} ({d.pos}) {fmt_value(d.value)}{tag}")
-    return head + "  \n" + " · ".join(parts)
+    if drops:
+        items = "".join(
+            f'<li>{html_text(d.name)} <span class="dpos">{d.pos}</span> '
+            f'<span class="dval">{fmt_value(d.value)}</span>'
+            + (f' <span class="dtag">{d.tag}</span>' if d.tag else "") + "</li>"
+            for d in drops)
+        body = f"<ol>{items}</ol>"
+    else:
+        body = '<div class="dnone">No QB/RB/WR/TE on roster</div>'
+    cls = "dcard open" if lv.open_spots else "dcard"
+    return f'<div class="{cls}">{head}{room}{body}</div>'
 
 
 def render_player_row(pid: str, players: dict, league_views: list, ktc: dict,
@@ -149,20 +182,19 @@ def render_player_row(pid: str, players: dict, league_views: list, ktc: dict,
     avail = sorted(sc.available_leagues(pid, p, league_views), key=lambda x: x.name.lower())
     if not avail:
         return False
-    with st.container(key=f"prow_{ctx}_{pid}"):
-        name_col, chips_col, drop_col = st.columns([1.7, 6, 0.9], gap="small", vertical_alignment="center")
-        with name_col:
-            st.markdown(f'<div class="pname">{html_text(p["name"])}</div>'
-                        f'<div class="pmeta">{player_meta(pid, p, ktc, adds)}</div>',
-                        unsafe_allow_html=True)
-        with chips_col:
-            my_total = sum(1 for lv in league_views if lv.my_roster is not None)
-            st.markdown(league_chips(avail, my_total), unsafe_allow_html=True)
-        with drop_col:
-            with st.popover("Drops", use_container_width=True):
-                st.caption(f"Cheapest {DROPS_PER_LEAGUE} per league (KTC), {p['name']}")
-                for lv in avail:
-                    st.markdown(drops_markdown(lv, players, ktc, include_stashed))
+    my_total = sum(1 for lv in league_views if lv.my_roster is not None)
+    tid = "dt-" + re.sub(r"[^A-Za-z0-9_-]", "_", f"{ctx}-{pid}")
+    cards = "".join(drop_card(lv, players, ktc, include_stashed) for lv in avail)
+    st.markdown(
+        f'<div class="prow">'
+        f'<input type="checkbox" id="{tid}" class="dtoggle">'
+        f'<div><div class="pname">{html_text(p["name"])}</div>'
+        f'<div class="pmeta">{player_meta(pid, p, ktc, adds)}</div></div>'
+        f'{league_chips(avail, my_total)}'
+        f'<label for="{tid}" class="dbtn">Drops</label>'
+        f'<div class="dpanel">{cards}</div>'
+        f'</div>',
+        unsafe_allow_html=True)
     return True
 
 
@@ -236,9 +268,14 @@ with st.sidebar:
     picked_types = {t for t in sc.LEAGUE_TYPES
                     if st.checkbox(t, value=t in sc.DEFAULT_LEAGUE_TYPES, key=f"type_{t}")}
     typed_leagues = [lg for lg in leagues if sc.league_type(lg) in picked_types]
+    drafting = [lg for lg in typed_leagues if lg.get("status") in sc.PRE_WAIVER_STATUSES]
+    typed_leagues = [lg for lg in typed_leagues if lg.get("status") not in sc.PRE_WAIVER_STATUSES]
     league_names = {str(lg["league_id"]): lg.get("name") or str(lg["league_id"]) for lg in typed_leagues}
     chosen = st.multiselect("Leagues", options=list(league_names), default=list(league_names),
                             format_func=lambda lid: league_names[lid])
+    if drafting:
+        st.caption("Hidden until their draft is done: "
+                   + ", ".join(lg.get("name") or str(lg["league_id"]) for lg in drafting))
     st.caption(f"Season {season} · {user.get('display_name', username)}")
     with st.expander("KTC match report"):
         st.write(f"{len(ktc)} of {ktc_match.rows} CSV rows matched to Sleeper players.")
@@ -257,7 +294,7 @@ try:
     # Fetch every league once (not just the selected ones) so flipping the
     # type filter or league picker never triggers another round of requests.
     rosters_by_league = get_rosters(tuple(sorted(str(lg["league_id"]) for lg in leagues)))
-    trending = get_trending(TRENDING_HOURS, TRENDING_LIMIT)
+    trending = sc.top_trending(get_trending(TRENDING_HOURS, TRENDING_FETCH), players, TRENDING_LIMIT)
 except sc.SleeperError as exc:
     st.error(str(exc))
     st.stop()
